@@ -65,6 +65,14 @@ PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/
 PLACES_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 PLACE_DETAILS_FIELDS = "name,formatted_phone_number,international_phone_number,website,formatted_address,rating"
 
+# Statuses that mean "your setup is wrong", not "no results" — worth stopping on.
+FATAL_API_STATUSES = {
+    "REQUEST_DENIED": "Check that the key is correct, the Places API is enabled, and any key restrictions allow this request.",
+    "INVALID_REQUEST": "The request was malformed — check the category/city values.",
+    "OVER_QUERY_LIMIT": "The key is out of quota, or billing is not enabled on the project.",
+    "ERROR": "Could not reach the Google Places API — check your network connection.",
+}
+
 CONTACT_PAGE_KEYWORDS = ("contact", "about")
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -82,6 +90,54 @@ EMAIL_BLOCKLIST_DOMAINS = (
     "email.com",
 )
 EMAIL_BLOCKLIST_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
+
+# A page often lists several addresses. These are the ones actually worth
+# reaching out to, best first — so 'reservations@' wins over 'press@'.
+PREFERRED_EMAIL_PREFIXES = (
+    "reservations",
+    "bookings",
+    "booking",
+    "enquiries",
+    "enquiry",
+    "inquiries",
+    "inquiry",
+    "info",
+    "contact",
+    "hello",
+    "sales",
+    "rentals",
+    "office",
+    "reception",
+    "admin",
+    "team",
+)
+
+# Real addresses, but the wrong desk for outreach.
+DEPRIORITIZED_EMAIL_PREFIXES = (
+    "press",
+    "media",
+    "careers",
+    "jobs",
+    "recruitment",
+    "privacy",
+    "legal",
+    "gdpr",
+    "dpo",
+    "abuse",
+    "webmaster",
+    "postmaster",
+    "hostmaster",
+    "noreply",
+    "no-reply",
+    "donotreply",
+    "unsubscribe",
+    "billing",
+    "invoices",
+    "accounts",
+)
+
+# Score at or above this means "good enough, stop crawling more pages".
+GOOD_EMAIL_SCORE = 50
 
 USER_AGENT = "Mozilla/5.0 (compatible; LeadGenBot/1.0; +local manual research tool)"
 
@@ -160,7 +216,12 @@ def request_json_with_retry(session, url, params, max_retries=3):
 
 
 def search_places(session, query, api_key, max_results):
-    """Google Places Text Search, paginated up to max_results (Google caps at 60)."""
+    """Google Places Text Search, paginated up to max_results (Google caps at 60).
+
+    Returns (places, fatal_error). fatal_error is a message string when the API
+    rejected the request outright (bad key, API not enabled, billing off) — those
+    are setup problems worth stopping on rather than writing an empty CSV.
+    """
     places = []
     params = {"query": query, "key": api_key}
     next_page_token = None
@@ -175,7 +236,10 @@ def search_places(session, query, api_key, max_results):
 
         if status == "ZERO_RESULTS":
             break
-        if status not in ("OK",):
+        if status in FATAL_API_STATUSES and not places:
+            detail = data.get("error_message") or FATAL_API_STATUSES[status]
+            return [], f"Google Places API returned {status}: {detail}"
+        if status != "OK":
             print(f"  Places Text Search returned status={status!r}: {data.get('error_message', '')}")
             break
 
@@ -190,7 +254,7 @@ def search_places(session, query, api_key, max_results):
 
         polite_sleep(API_REQUEST_DELAY)
 
-    return places[:max_results]
+    return places[:max_results], None
 
 
 def get_place_details(session, place_id, api_key):
@@ -200,6 +264,33 @@ def get_place_details(session, place_id, api_key):
     if data.get("status") != "OK":
         return {}
     return data.get("result", {})
+
+
+def score_email(email, site_domain=""):
+    """Rank an email by how useful it is as an outreach contact (higher is better)."""
+    local, _, domain = email.partition("@")
+    score = 0
+
+    for i, prefix in enumerate(PREFERRED_EMAIL_PREFIXES):
+        if local == prefix or local.startswith(prefix):
+            score += 100 - i
+            break
+
+    if any(local == p or local.startswith(p) for p in DEPRIORITIZED_EMAIL_PREFIXES):
+        score -= 100
+
+    # An address on the business's own domain beats a webmaster's or agency's.
+    if site_domain and domain == site_domain:
+        score += 10
+
+    return score
+
+
+def pick_best_email(emails, site_domain=""):
+    """Choose the best outreach address from a set; ties break alphabetically."""
+    if not emails:
+        return ""
+    return max(sorted(emails), key=lambda e: score_email(e, site_domain))
 
 
 def is_valid_email(email):
@@ -274,26 +365,31 @@ def crawl_site_for_email(session, website):
         return ""
 
     url = website if website.startswith(("http://", "https://")) else f"http://{website}"
+    site_domain = urlparse(url).netloc.lower().removeprefix("www.")
 
     polite_sleep(SITE_REQUEST_DELAY)
     html = fetch_page(session, url)
     if not html:
         return ""
 
-    emails, soup = extract_emails_from_html(html)
-    if emails:
-        return sorted(emails)[0]
+    found, soup = extract_emails_from_html(html)
+    best = pick_best_email(found, site_domain)
 
-    for link in find_contact_page_links(soup, url):
-        polite_sleep(SITE_REQUEST_DELAY)
-        sub_html = fetch_page(session, link)
-        if not sub_html:
-            continue
-        sub_emails, _ = extract_emails_from_html(sub_html)
-        if sub_emails:
-            return sorted(sub_emails)[0]
+    # A homepage often only exposes a generic or wrong-desk address, so keep
+    # checking contact/about pages until we find a genuinely good one.
+    if not best or score_email(best, site_domain) < GOOD_EMAIL_SCORE:
+        for link in find_contact_page_links(soup, url):
+            polite_sleep(SITE_REQUEST_DELAY)
+            sub_html = fetch_page(session, link)
+            if not sub_html:
+                continue
+            sub_emails, _ = extract_emails_from_html(sub_html)
+            found |= sub_emails
+            best = pick_best_email(found, site_domain)
+            if best and score_email(best, site_domain) >= GOOD_EMAIL_SCORE:
+                break
 
-    return ""
+    return best
 
 
 def build_row(details, email):
@@ -334,10 +430,13 @@ def main():
     session.headers.update({"User-Agent": USER_AGENT})
 
     print(f"Searching Google Places for: {query!r}")
-    places = search_places(session, query, api_key, args.max_results)
+    places, fatal_error = search_places(session, query, api_key, args.max_results)
+    if fatal_error:
+        sys.exit(f"Error: {fatal_error}\nSee README.md for API key setup.")
     print(f"Found {len(places)} candidate business(es). Fetching details...")
 
     rows = []
+    skipped = 0
     for i, place in enumerate(places, 1):
         place_id = place.get("place_id")
         if not place_id:
@@ -350,17 +449,30 @@ def main():
         name = details.get("name") or "(unknown)"
         website = details.get("website", "")
 
-        email = ""
-        if website and not args.skip_email_crawl:
-            print(f"  [{i}/{len(places)}] {name}: crawling {website} for an email...")
-            email = crawl_site_for_email(session, website)
-        else:
-            print(f"  [{i}/{len(places)}] {name}: no website to crawl")
+        row = build_row(details, "")
+        if not any(row[column] for column in CSV_COLUMNS):
+            # Details lookup failed and Text Search gave us nothing usable — an
+            # all-blank row is just noise in the CSV.
+            skipped += 1
+            continue
 
-        rows.append(build_row(details, email))
+        prefix = f"  [{i}/{len(places)}] {name}"
+        if not website:
+            print(f"{prefix}: no website listed")
+        elif args.skip_email_crawl:
+            print(f"{prefix}: skipping email crawl")
+        else:
+            print(f"{prefix}: crawling {website} for an email...")
+            row["email"] = crawl_site_for_email(session, website)
+
+        rows.append(row)
 
     write_csv(rows, args.output)
-    print(f"\nWrote {len(rows)} lead(s) to {args.output}")
+
+    with_email = sum(1 for row in rows if row["email"])
+    print(f"\nWrote {len(rows)} lead(s) to {args.output} ({with_email} with an email address)")
+    if skipped:
+        print(f"Skipped {skipped} result(s) with no usable details.")
 
 
 if __name__ == "__main__":

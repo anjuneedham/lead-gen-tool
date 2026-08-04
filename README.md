@@ -10,7 +10,9 @@ For each business it pulls:
 - Name, phone, website, address, and rating — from the Google Places API
   (Text Search + Place Details)
 - Email — best-effort, by crawling the business's own homepage and a
-  contact/about page for `mailto:` links or an email-shaped string
+  contact/about page for `mailto:` links or an email-shaped string. When a
+  site lists several addresses, the one most useful for outreach wins
+  (`reservations@`/`info@` over `press@`/`careers@`/`noreply@`).
 
 It writes one row per business to a CSV with columns:
 `business_name, phone, email, website, address, rating`. Missing fields are
@@ -36,6 +38,8 @@ other message to the businesses it finds — outreach is on you, manually.
    large searches.
 
 ## 2. Install dependencies
+
+Requires **Python 3.9+**.
 
 ```bash
 git clone https://github.com/anjuneedham/lead-gen-tool
@@ -95,6 +99,24 @@ rather not pass flags every time.
   hammer any single site.
 - `--max-results` directly controls your Google Places bill — start small
   (10–20) to sanity-check results before scaling up.
+
+## Troubleshooting
+
+**`REQUEST_DENIED`** — the most common first-run error. It means one of:
+the key is wrong, the **Places API** isn't enabled on the project, billing
+isn't enabled, or a key restriction (IP/referrer) is blocking the call.
+Work through step 1 above again.
+
+**`OVER_QUERY_LIMIT`** — out of quota, or billing isn't enabled. The script
+retries with backoff before giving up.
+
+**Ran fine but most emails are blank** — expected. Many small businesses
+publish only a contact form or put their address in an image. Phone numbers
+are the more reliable channel for these leads; consider `--skip-email-crawl`
+for a much faster run when you only need phone/address.
+
+The script exits with a non-zero status on setup errors, so you can chain it
+in a shell script safely.
 
 ## Limitations
 
