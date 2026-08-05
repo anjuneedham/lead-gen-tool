@@ -1,0 +1,124 @@
+# Research config: who you're looking for, and where.
+# Copy to markets.yml and edit. Run: python find_leads.py research --config markets.yml
+
+# ---------------------------------------------------------------------------
+# Ideal customer profile. These weights are the model — argue with them.
+# Every lead's CSV row carries the reasons behind its score, so when a result
+# looks wrong you can see which weight caused it and retune.
+# ---------------------------------------------------------------------------
+icp:
+  name: "Independent rental operator who already takes bookings by message"
+
+  weights:
+    uses_whatsapp: 35        # strongest signal: already living on the channel
+    independent: 20          # the decision is local, not at a head office
+    reachable_email: 15      # you can actually start a conversation
+    right_size: 15           # big enough to have the problem, small enough to buy
+    good_rating: 10          # a business worth having as a reference
+    has_phone: 10
+    contact_form_only: 10    # enquiries land somewhere awkward — that's the pitch
+    has_website: 5
+    has_booking_engine: -10  # already pays for software; harder, longer sale
+    no_web_presence: -15     # often dormant or unreachable
+
+  # Google review count as a proxy for size. Below the floor is usually a
+  # dormant listing; above the ceiling you're talking to a chain or a hotel.
+  review_count_range: [5, 400]
+  min_rating: 3.5
+  exclude_chains: true
+  exclude_permanently_closed: true
+
+  # Score thresholds for the A/B/C tier column.
+  tiers:
+    A: 70
+    B: 45
+    C: 0
+
+# How many businesses to pull per market+category pair. This is the main cost
+# dial — each one costs a Place Details call.
+max_per_market: 40
+crawl_websites: true
+
+categories:
+  - id: car_rental
+    query: "car rental agency"
+  - id: vacation_rental
+    query: "vacation rental management company"
+
+# ---------------------------------------------------------------------------
+# Markets. `language` returns names in the local language instead of
+# transliterated English; `region` biases ranking to that country, which
+# matters for ambiguous city names (Córdoba is in both Spain and Argentina).
+#
+# `areas` breaks Google's hard 60-results-per-query ceiling: each area runs as
+# its own query and results are deduplicated by place_id. Use it in dense
+# cities where one query clearly isn't reaching the whole market.
+# ---------------------------------------------------------------------------
+markets:
+  # --- Southern Europe: dense short-term rental markets, WhatsApp-first ---
+  - city: Lisbon
+    country: Portugal
+    language: pt
+    region: pt
+    currency: EUR
+    areas: [Baixa, Alfama, Belém, Parque das Nações]
+    notes: "High STR density; WhatsApp is the default business channel."
+
+  - city: Málaga
+    country: Spain
+    language: es
+    region: es
+    currency: EUR
+    notes: "Costa del Sol car hire cluster."
+
+  - city: Split
+    country: Croatia
+    language: hr
+    region: hr
+    currency: EUR
+    notes: "Highly seasonal — scan before the season, not during."
+
+  # --- Latin America: WhatsApp is the primary channel almost everywhere ---
+  - city: Medellín
+    country: Colombia
+    language: es
+    region: co
+    currency: COP
+
+  - city: Mexico City
+    country: Mexico
+    language: es
+    region: mx
+    currency: MXN
+    areas: [Roma Norte, Condesa, Polanco]
+
+  # --- Southeast Asia ---
+  - city: Bali
+    country: Indonesia
+    language: id
+    region: id
+    currency: IDR
+    areas: [Canggu, Seminyak, Ubud]
+    notes: "Villa management is fragmented — many one-to-five property operators."
+
+  # --- Africa / Middle East ---
+  - city: Cape Town
+    country: South Africa
+    language: en
+    region: za
+    currency: ZAR
+
+  - city: Dubai
+    country: United Arab Emirates
+    language: en
+    region: ae
+    currency: AED
+    notes: "Holiday-homes sector is licensed and consolidating — expect chains."
+
+  # --- English-speaking benchmarks, for comparison against the above ---
+  - city: Austin
+    country: USA
+    language: en
+    region: us
+    currency: USD
+    notes: "Benchmark market: high software adoption, low WhatsApp usage."

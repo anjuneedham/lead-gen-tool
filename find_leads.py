@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
-"""
-Local business lead generator.
+"""Local business market research and lead qualification, worldwide.
 
-Searches the Google Places API for businesses in a given category/location
-(e.g. "car rental" agencies in "Austin, TX, USA"), pulls their name, phone,
-website, address and rating via Text Search + Place Details, then makes a
-best-effort attempt to find a contact email by crawling the business's own
-homepage and contact/about page. Results are written to a CSV for manual
-outreach.
+Two modes:
 
-This script only *collects* data — it does not send emails, texts, or any
-other outbound message to the businesses it finds.
+    scan      one city, one category — the quick "who's in this town" pass
+    research  many cities and categories from a YAML config, scored and
+              ranked so you can see which market is worth entering at all
 
-Usage:
-    python find_leads.py --category "car rental" --city "Austin" --country "USA"
-    python find_leads.py --category property_rental --city "Lisbon" --country "Portugal" --output lisbon_leads.csv
+Both write CSVs for manual outreach. Nothing here sends messages.
 
-Run `python find_leads.py --help` for all options. See README.md for setup.
+    python find_leads.py scan --category car_rental --city Lisbon --country Portugal
+    python find_leads.py research --config markets.yml --dry-run
+    python find_leads.py research --config markets.yml --out-dir out/
+
+Run `python find_leads.py <mode> --help` for the full flag list, and see
+README.md for API key setup.
 """
 
 import argparse
-import csv
 import os
-import re
 import sys
 import time
-from html import unescape
-from urllib.parse import urljoin, urlparse
+from datetime import datetime, timezone
 
 import requests
-from bs4 import BeautifulSoup
 
 try:
     from dotenv import load_dotenv
@@ -38,442 +32,261 @@ try:
 except ImportError:
     pass
 
-# ---------------------------------------------------------------------------
-# Config — edit these defaults, or override via CLI flags (see --help).
-# ---------------------------------------------------------------------------
+from leadgen.cache import Cache
+from leadgen.config import ICP, Category, Market, ResearchConfig, load_config
+from leadgen.enrich import SiteEnricher
+from leadgen.export import write_leads, write_legacy_csv, write_markets, write_run_report
+from leadgen.places import PlacesClient, PlacesError
+from leadgen.research import rank_leads, rank_markets, research_market
 
-DEFAULT_CATEGORY = "car rental"
-DEFAULT_CITY = "Austin"
-DEFAULT_COUNTRY = "USA"
-DEFAULT_OUTPUT = "leads.csv"
-DEFAULT_MAX_RESULTS = 20  # Each result costs one Place Details call — keep modest.
-
-REQUEST_TIMEOUT = 10  # seconds, for website crawling requests
-API_REQUEST_DELAY = 1.0  # seconds between Google API calls (rate limiting)
-SITE_REQUEST_DELAY = 1.5  # seconds between requests made to a business's own website
-NEXT_PAGE_TOKEN_DELAY = 2.5  # Google requires a short delay before a next_page_token activates
-MAX_CONTACT_PAGES_TO_CRAWL = 2  # besides the homepage, how many contact/about links to try
-
-# Friendly shortcuts for --category. Free-text categories work too.
 CATEGORY_PRESETS = {
-    "car_rental": "car rental",
-    "property_rental": "vacation rental property management",
-    "airbnb_rental": "Airbnb rental agency",
+    "car_rental": "car rental agency",
+    "property_rental": "vacation rental management company",
+    "airbnb_rental": "short term rental agency",
+    "boat_rental": "boat rental",
+    "tour_operator": "tour operator",
 }
 
-PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-PLACES_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
-PLACE_DETAILS_FIELDS = "name,formatted_phone_number,international_phone_number,website,formatted_address,rating"
-
-# Statuses that mean "your setup is wrong", not "no results" — worth stopping on.
-FATAL_API_STATUSES = {
-    "REQUEST_DENIED": "Check that the key is correct, the Places API is enabled, and any key restrictions allow this request.",
-    "INVALID_REQUEST": "The request was malformed — check the category/city values.",
-    "OVER_QUERY_LIMIT": "The key is out of quota, or billing is not enabled on the project.",
-    "ERROR": "Could not reach the Google Places API — check your network connection.",
-}
-
-CONTACT_PAGE_KEYWORDS = ("contact", "about")
-
-EMAIL_REGEX = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-MAILTO_REGEX = re.compile(r'href=["\']mailto:([^"\'?]+)', re.IGNORECASE)
-
-# Emails matching these are dropped as false positives (tracking pixels,
-# placeholder addresses, image filenames that happen to look like emails).
-EMAIL_BLOCKLIST_DOMAINS = (
-    "sentry.io",
-    "wixpress.com",
-    "example.com",
-    "godaddy.com",
-    "yourdomain.com",
-    "domain.com",
-    "email.com",
-)
-EMAIL_BLOCKLIST_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
-
-# A page often lists several addresses. These are the ones actually worth
-# reaching out to, best first — so 'reservations@' wins over 'press@'.
-PREFERRED_EMAIL_PREFIXES = (
-    "reservations",
-    "bookings",
-    "booking",
-    "enquiries",
-    "enquiry",
-    "inquiries",
-    "inquiry",
-    "info",
-    "contact",
-    "hello",
-    "sales",
-    "rentals",
-    "office",
-    "reception",
-    "admin",
-    "team",
-)
-
-# Real addresses, but the wrong desk for outreach.
-DEPRIORITIZED_EMAIL_PREFIXES = (
-    "press",
-    "media",
-    "careers",
-    "jobs",
-    "recruitment",
-    "privacy",
-    "legal",
-    "gdpr",
-    "dpo",
-    "abuse",
-    "webmaster",
-    "postmaster",
-    "hostmaster",
-    "noreply",
-    "no-reply",
-    "donotreply",
-    "unsubscribe",
-    "billing",
-    "invoices",
-    "accounts",
-)
-
-# Score at or above this means "good enough, stop crawling more pages".
-GOOD_EMAIL_SCORE = 50
-
-USER_AGENT = "Mozilla/5.0 (compatible; LeadGenBot/1.0; +local manual research tool)"
-
-CSV_COLUMNS = ["business_name", "phone", "email", "website", "address", "rating"]
+DEFAULT_CACHE = ".leadgen-cache.json"
 
 
-def parse_args():
+def add_common_flags(parser):
+    parser.add_argument("--api-key", help="Google Places API key (else GOOGLE_PLACES_API_KEY).")
+    parser.add_argument("--no-cache", action="store_true", help="Ignore the local API response cache.")
+    parser.add_argument("--cache-file", default=DEFAULT_CACHE, help=f"Cache path. Default: {DEFAULT_CACHE}")
+    parser.add_argument("--skip-email-crawl", action="store_true", help="Skip website crawling entirely (faster, cheaper, far less signal).")
+    parser.add_argument("--ignore-robots", action="store_true", help="Crawl pages robots.txt disallows. Off by default — leave it off.")
+    parser.add_argument("--site-delay", type=float, default=1.5, help="Seconds between requests to a business site. Default: 1.5")
+
+
+def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="Find local businesses via Google Places and export leads to CSV."
+        description="Research local business markets worldwide and export qualified leads.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--category",
-        default=DEFAULT_CATEGORY,
-        help=(
-            "Business category to search for. Accepts a preset "
-            f"({', '.join(CATEGORY_PRESETS)}) or free text, e.g. 'car rental'. "
-            f"Default: {DEFAULT_CATEGORY!r}"
-        ),
-    )
-    parser.add_argument("--city", default=DEFAULT_CITY, help=f"City to search in. Default: {DEFAULT_CITY!r}")
-    parser.add_argument(
-        "--country", default=DEFAULT_COUNTRY, help=f"Country to search in. Default: {DEFAULT_COUNTRY!r}"
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Google Places API key. Falls back to the GOOGLE_PLACES_API_KEY env var.",
-    )
-    parser.add_argument(
-        "--output", default=DEFAULT_OUTPUT, help=f"CSV file to write. Default: {DEFAULT_OUTPUT!r}"
-    )
-    parser.add_argument(
-        "--max-results",
-        type=int,
-        default=DEFAULT_MAX_RESULTS,
-        help=f"Max number of businesses to fetch (Google caps Text Search at 60). Default: {DEFAULT_MAX_RESULTS}",
-    )
-    parser.add_argument(
-        "--skip-email-crawl",
-        action="store_true",
-        help="Skip crawling business websites for emails (Places data only, faster).",
-    )
-    return parser.parse_args()
+    sub = parser.add_subparsers(dest="mode")
+
+    scan = sub.add_parser("scan", help="Scan a single city for one category.")
+    scan.add_argument("--category", default="car_rental", help=f"Preset ({', '.join(CATEGORY_PRESETS)}) or free text.")
+    scan.add_argument("--city", default="Austin")
+    scan.add_argument("--country", default="USA")
+    scan.add_argument("--language", default="", help="ISO 639-1 code for localized results, e.g. 'pt'.")
+    scan.add_argument("--region", default="", help="ccTLD to bias results toward, e.g. 'pt'.")
+    scan.add_argument("--max-results", type=int, default=20, help="Businesses to fetch. Google caps one query at 60. Default: 20")
+    scan.add_argument("--output", default="leads.csv")
+    scan.add_argument("--legacy-columns", action="store_true", help="Write the original 6-column CSV instead of the scored sheet.")
+    add_common_flags(scan)
+
+    research = sub.add_parser("research", help="Scan many markets from a config and rank them.")
+    research.add_argument("--config", default="markets.yml")
+    research.add_argument("--out-dir", default="out")
+    research.add_argument("--max-per-market", type=int, help="Override max_per_market from the config.")
+    research.add_argument("--dry-run", action="store_true", help="Show the plan and estimated API calls without spending anything.")
+    add_common_flags(research)
+
+    # Keep the original flag-only invocation working: `find_leads.py --city X`.
+    if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
+        argv = ["scan"] + argv
+    args = parser.parse_args(argv)
+    if not args.mode:
+        parser.print_help()
+        sys.exit(0)
+    return args
 
 
-def build_query(category, city, country):
-    location = ", ".join(part for part in (city, country) if part)
-    return f"{category} in {location}" if location else category
-
-
-def polite_sleep(seconds):
-    if seconds > 0:
-        time.sleep(seconds)
-
-
-def request_json_with_retry(session, url, params, max_retries=3):
-    """GET a JSON endpoint, retrying on transient Google API errors."""
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-        except (requests.RequestException, ValueError) as exc:
-            print(f"  Warning: request failed ({exc}), attempt {attempt}/{max_retries}")
-            polite_sleep(2 * attempt)
-            continue
-
-        status = data.get("status")
-        if status == "OVER_QUERY_LIMIT" and attempt < max_retries:
-            print("  Warning: hit OVER_QUERY_LIMIT, backing off...")
-            polite_sleep(3 * attempt)
-            continue
-        return data
-
-    return {"status": "ERROR", "results": []}
-
-
-def search_places(session, query, api_key, max_results):
-    """Google Places Text Search, paginated up to max_results (Google caps at 60).
-
-    Returns (places, fatal_error). fatal_error is a message string when the API
-    rejected the request outright (bad key, API not enabled, billing off) — those
-    are setup problems worth stopping on rather than writing an empty CSV.
-    """
-    places = []
-    params = {"query": query, "key": api_key}
-    next_page_token = None
-
-    while len(places) < max_results:
-        if next_page_token:
-            polite_sleep(NEXT_PAGE_TOKEN_DELAY)
-            params = {"pagetoken": next_page_token, "key": api_key}
-
-        data = request_json_with_retry(session, PLACES_TEXT_SEARCH_URL, params)
-        status = data.get("status")
-
-        if status == "ZERO_RESULTS":
-            break
-        if status in FATAL_API_STATUSES and not places:
-            detail = data.get("error_message") or FATAL_API_STATUSES[status]
-            return [], f"Google Places API returned {status}: {detail}"
-        if status != "OK":
-            print(f"  Places Text Search returned status={status!r}: {data.get('error_message', '')}")
-            break
-
-        for result in data.get("results", []):
-            places.append(result)
-            if len(places) >= max_results:
-                break
-
-        next_page_token = data.get("next_page_token")
-        if not next_page_token:
-            break
-
-        polite_sleep(API_REQUEST_DELAY)
-
-    return places[:max_results], None
-
-
-def get_place_details(session, place_id, api_key):
-    params = {"place_id": place_id, "fields": PLACE_DETAILS_FIELDS, "key": api_key}
-    polite_sleep(API_REQUEST_DELAY)
-    data = request_json_with_retry(session, PLACES_DETAILS_URL, params)
-    if data.get("status") != "OK":
-        return {}
-    return data.get("result", {})
-
-
-def score_email(email, site_domain=""):
-    """Rank an email by how useful it is as an outreach contact (higher is better)."""
-    local, _, domain = email.partition("@")
-    score = 0
-
-    for i, prefix in enumerate(PREFERRED_EMAIL_PREFIXES):
-        if local == prefix or local.startswith(prefix):
-            score += 100 - i
-            break
-
-    if any(local == p or local.startswith(p) for p in DEPRIORITIZED_EMAIL_PREFIXES):
-        score -= 100
-
-    # An address on the business's own domain beats a webmaster's or agency's.
-    if site_domain and domain == site_domain:
-        score += 10
-
-    return score
-
-
-def pick_best_email(emails, site_domain=""):
-    """Choose the best outreach address from a set; ties break alphabetically."""
-    if not emails:
-        return ""
-    return max(sorted(emails), key=lambda e: score_email(e, site_domain))
-
-
-def is_valid_email(email):
-    email = email.lower().strip().strip(".,;:")
-    if not EMAIL_REGEX.fullmatch(email):
-        return False
-    domain = email.split("@")[-1]
-    if domain in EMAIL_BLOCKLIST_DOMAINS:
-        return False
-    if email.endswith(EMAIL_BLOCKLIST_EXTENSIONS):
-        return False
-    return True
-
-
-def extract_emails_from_html(html):
-    emails = set()
-
-    for match in MAILTO_REGEX.finditer(html):
-        candidate = unescape(match.group(1)).strip().split("?")[0]
-        if is_valid_email(candidate):
-            emails.add(candidate.lower())
-
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ")
-    for match in EMAIL_REGEX.finditer(text):
-        candidate = match.group(0)
-        if is_valid_email(candidate):
-            emails.add(candidate.lower())
-
-    return emails, soup
-
-
-def find_contact_page_links(soup, base_url):
-    """Find same-domain links whose href/text look like a contact or about page."""
-    base_domain = urlparse(base_url).netloc
-    links = []
-    seen = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href or href.startswith(("mailto:", "tel:", "javascript:")):
-            continue
-
-        absolute = urljoin(base_url, href)
-        if urlparse(absolute).netloc != base_domain:
-            continue
-
-        haystack = f"{href} {a.get_text(' ')}".lower()
-        if any(keyword in haystack for keyword in CONTACT_PAGE_KEYWORDS):
-            if absolute not in seen:
-                seen.add(absolute)
-                links.append(absolute)
-
-    return links[:MAX_CONTACT_PAGES_TO_CRAWL]
-
-
-def fetch_page(session, url):
-    try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        if "text/html" not in content_type and "html" not in content_type:
-            return None
-        return resp.text
-    except requests.RequestException:
-        return None
-
-
-def crawl_site_for_email(session, website):
-    """Best-effort: check the homepage, then a contact/about page, for an email."""
-    if not website:
-        return ""
-
-    url = website if website.startswith(("http://", "https://")) else f"http://{website}"
-    site_domain = urlparse(url).netloc.lower().removeprefix("www.")
-
-    polite_sleep(SITE_REQUEST_DELAY)
-    html = fetch_page(session, url)
-    if not html:
-        return ""
-
-    found, soup = extract_emails_from_html(html)
-    best = pick_best_email(found, site_domain)
-
-    # A homepage often only exposes a generic or wrong-desk address, so keep
-    # checking contact/about pages until we find a genuinely good one.
-    if not best or score_email(best, site_domain) < GOOD_EMAIL_SCORE:
-        for link in find_contact_page_links(soup, url):
-            polite_sleep(SITE_REQUEST_DELAY)
-            sub_html = fetch_page(session, link)
-            if not sub_html:
-                continue
-            sub_emails, _ = extract_emails_from_html(sub_html)
-            found |= sub_emails
-            best = pick_best_email(found, site_domain)
-            if best and score_email(best, site_domain) >= GOOD_EMAIL_SCORE:
-                break
-
-    return best
-
-
-def build_row(details, email):
-    phone = details.get("formatted_phone_number") or details.get("international_phone_number") or ""
-    rating = details.get("rating")
-    return {
-        "business_name": details.get("name", ""),
-        "phone": phone,
-        "email": email,
-        "website": details.get("website", ""),
-        "address": details.get("formatted_address", ""),
-        "rating": rating if rating is not None else "",
-    }
-
-
-def write_csv(rows, output_path):
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-
-def main():
-    args = parse_args()
-
-    api_key = args.api_key or os.environ.get("GOOGLE_PLACES_API_KEY")
-    if not api_key:
+def resolve_api_key(args):
+    key = args.api_key or os.environ.get("GOOGLE_PLACES_API_KEY")
+    if not key:
         sys.exit(
-            "Error: no Google Places API key found. Pass --api-key or set GOOGLE_PLACES_API_KEY "
-            "(see README.md for how to get one)."
+            "Error: no Google Places API key found. Pass --api-key or set "
+            "GOOGLE_PLACES_API_KEY (see README.md for how to get one)."
+        )
+    return key
+
+
+def build_clients(args, api_key):
+    cache = Cache(args.cache_file, enabled=not args.no_cache)
+    session = requests.Session()
+    client = PlacesClient(api_key, session=session, cache=cache)
+    enricher = SiteEnricher(
+        delay=args.site_delay,
+        respect_robots=not args.ignore_robots,
+    )
+    return client, enricher, cache
+
+
+def cmd_scan(args):
+    api_key = resolve_api_key(args)
+    client, enricher, cache = build_clients(args, api_key)
+
+    query = CATEGORY_PRESETS.get(args.category, args.category)
+    category = Category(id=args.category, query=query)
+    market = Market(city=args.city, country=args.country, language=args.language, region=args.region)
+    config = ResearchConfig(
+        icp=ICP(),
+        categories=[category],
+        markets=[market],
+        max_per_market=args.max_results,
+        crawl_websites=not args.skip_email_crawl,
+    )
+
+    print(f"Scanning {market.id} for {category.label!r}...")
+
+    def progress(index, total, lead):
+        flag = f"[{lead.tier}]" if lead.tier != "-" else "[ ]"
+        print(f"  {flag} {index}/{total} {lead.business_name or '(unnamed)'} — score {lead.fit_score}")
+
+    try:
+        leads, summary = research_market(client, enricher, market, category, config, progress)
+    except PlacesError as exc:
+        cache.save()
+        sys.exit(f"Error: {exc}\nSee README.md for API key setup.")
+
+    leads = rank_leads(leads)
+    if args.legacy_columns:
+        write_legacy_csv(leads, args.output)
+    else:
+        write_leads(leads, args.output)
+    cache.save()
+
+    print(f"\nWrote {len(leads)} lead(s) to {args.output}")
+    report_totals(leads, summary, client, cache)
+    return 0
+
+
+def report_totals(leads, summary, client, cache):
+    with_email = sum(1 for lead in leads if lead.email)
+    tier_a = sum(1 for lead in leads if lead.tier == "A")
+    whatsapp = sum(1 for lead in leads if lead.whatsapp)
+    print(
+        f"  {tier_a} tier-A · {with_email} with email · {whatsapp} with a WhatsApp number "
+        f"· opportunity score {summary.opportunity_score}/100"
+    )
+    print(
+        f"  API calls: {client.search_calls} search + {client.details_calls} details "
+        f"(cache hits: {cache.hits})"
+    )
+
+
+def plan_summary(config):
+    lines = []
+    for market in config.markets:
+        for category in config.categories:
+            lines.append(f"  {market.id:<34} {category.label:<32} {len(market.queries(category))} query(ies)")
+    return lines
+
+
+def cmd_research(args):
+    try:
+        config = load_config(args.config)
+    except ValueError as exc:
+        sys.exit(f"Error: {exc}")
+
+    if args.max_per_market:
+        config.max_per_market = args.max_per_market
+    if args.skip_email_crawl:
+        config.crawl_websites = False
+
+    pairs = len(config.markets) * len(config.categories)
+    searches = config.planned_queries
+    max_details = pairs * config.max_per_market
+
+    print(f"ICP: {config.icp.name}")
+    print(f"Plan: {len(config.markets)} market(s) x {len(config.categories)} category(ies) = {pairs} scans")
+    for line in plan_summary(config):
+        print(line)
+    print(
+        f"\nEstimated API calls: ~{searches} Text Search (plus pagination) "
+        f"and up to {max_details} Place Details."
+    )
+    print(
+        "Place Details is the expensive half and is billed per call and per field tier. "
+        "Check current rates at https://developers.google.com/maps/billing-and-pricing "
+        "and start with a small --max-per-market."
+    )
+
+    if args.dry_run:
+        print("\nDry run — nothing was requested and nothing was billed.")
+        return 0
+
+    api_key = resolve_api_key(args)
+    client, enricher, cache = build_clients(args, api_key)
+
+    all_leads, summaries = [], []
+    started = time.time()
+
+    for market in config.markets:
+        for category in config.categories:
+            print(f"\n=== {market.id} · {category.label} ===")
+            try:
+                leads, summary = research_market(client, enricher, market, category, config)
+            except PlacesError as exc:
+                cache.save()
+                sys.exit(f"Error: {exc}\nSee README.md for API key setup.")
+
+            all_leads.extend(leads)
+            summaries.append(summary)
+            print(
+                f"  {summary.businesses_found} found · {summary.qualified} qualified · "
+                f"{summary.tier_a} tier-A · {summary.contactability_pct}% contactable · "
+                f"{summary.whatsapp_pct}% on WhatsApp · opportunity {summary.opportunity_score}/100"
+            )
+            cache.save()
+
+    ranked_leads = rank_leads(all_leads)
+    ranked_markets = rank_markets(summaries)
+
+    leads_path = os.path.join(args.out_dir, "leads.csv")
+    markets_path = os.path.join(args.out_dir, "markets.csv")
+    report_path = os.path.join(args.out_dir, "run.json")
+
+    write_leads(ranked_leads, leads_path)
+    write_markets(ranked_markets, markets_path)
+    write_run_report(report_path, {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "icp": config.icp.name,
+        "weights": config.icp.weights,
+        "markets": len(config.markets),
+        "categories": [c.label for c in config.categories],
+        "leads": len(ranked_leads),
+        "tier_a": sum(1 for l in ranked_leads if l.tier == "A"),
+        "api_calls": {"text_search": client.search_calls, "place_details": client.details_calls},
+        "cache": {"hits": cache.hits, "misses": cache.misses},
+        "duration_seconds": round(time.time() - started, 1),
+    })
+    cache.save()
+
+    print("\n" + "=" * 66)
+    print(f"{len(ranked_leads)} leads across {len(summaries)} market scans")
+    print(f"  {leads_path}   — every lead, best fit first")
+    print(f"  {markets_path} — markets ranked by opportunity")
+    print(f"  {report_path}  — run metadata and API usage")
+
+    print("\nTop markets by opportunity:")
+    for summary in ranked_markets[:5]:
+        print(
+            f"  {summary.opportunity_score:>3}/100  {summary.market:<32} "
+            f"{summary.qualified:>3} qualified  {summary.whatsapp_pct:>5}% WhatsApp"
         )
 
-    category = CATEGORY_PRESETS.get(args.category, args.category)
-    query = build_query(category, args.city, args.country)
+    print("\nTop leads:")
+    for lead in ranked_leads[:5]:
+        contact = lead.whatsapp or lead.email or lead.phone_e164 or lead.phone or "no contact"
+        print(f"  [{lead.tier}] {lead.fit_score:>3}  {lead.business_name[:34]:<34} {contact}")
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    print(
+        f"\nAPI calls: {client.search_calls} search + {client.details_calls} details "
+        f"(cache hits: {cache.hits})"
+    )
+    return 0
 
-    print(f"Searching Google Places for: {query!r}")
-    places, fatal_error = search_places(session, query, api_key, args.max_results)
-    if fatal_error:
-        sys.exit(f"Error: {fatal_error}\nSee README.md for API key setup.")
-    print(f"Found {len(places)} candidate business(es). Fetching details...")
 
-    rows = []
-    skipped = 0
-    for i, place in enumerate(places, 1):
-        place_id = place.get("place_id")
-        if not place_id:
-            continue
-
-        details = get_place_details(session, place_id, api_key)
-        if not details:
-            details = {"name": place.get("name", ""), "formatted_address": place.get("formatted_address", "")}
-
-        name = details.get("name") or "(unknown)"
-        website = details.get("website", "")
-
-        row = build_row(details, "")
-        if not any(row[column] for column in CSV_COLUMNS):
-            # Details lookup failed and Text Search gave us nothing usable — an
-            # all-blank row is just noise in the CSV.
-            skipped += 1
-            continue
-
-        prefix = f"  [{i}/{len(places)}] {name}"
-        if not website:
-            print(f"{prefix}: no website listed")
-        elif args.skip_email_crawl:
-            print(f"{prefix}: skipping email crawl")
-        else:
-            print(f"{prefix}: crawling {website} for an email...")
-            row["email"] = crawl_site_for_email(session, website)
-
-        rows.append(row)
-
-    write_csv(rows, args.output)
-
-    with_email = sum(1 for row in rows if row["email"])
-    print(f"\nWrote {len(rows)} lead(s) to {args.output} ({with_email} with an email address)")
-    if skipped:
-        print(f"Skipped {skipped} result(s) with no usable details.")
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.mode == "research":
+        return cmd_research(args)
+    return cmd_scan(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
