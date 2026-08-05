@@ -163,16 +163,35 @@ Place Details is the expensive half, billed per call and per field tier.
 - **`--dry-run` first**, always. It prints the exact call count.
 - **`max_per_market`** is the main dial. Start at 10-20 and scale once the
   results look right.
-- **Responses are cached** to `.leadgen-cache.json` (30-day TTL). Re-running
-  to retune ICP weights costs nothing — only genuinely new lookups bill.
+- **Both API responses and website crawls are cached** to
+  `.leadgen-cache.json` (30-day TTL). Re-running to retune ICP weights and
+  re-score costs no API spend and no re-crawling — it completes in seconds.
+  That's what makes the tighten-the-model loop in
+  [WORKFLOWS.md](WORKFLOWS.md) practical.
 - **`--skip-email-crawl`** skips website crawling entirely when you only need
   phone and address.
+
+### How long a run takes
+
+Crawling dominates wall-clock time, not the API. Budget roughly **3-8 seconds
+per business that has a website** — a homepage plus up to two contact pages,
+rate-limited per domain, with slow or unresponsive sites hitting a 10s
+timeout each.
+
+| Run | Businesses | Rough time |
+|---|---|---|
+| One city, `--max-results 20` | 20 | 1-3 min |
+| Example config, `--max-per-market 10` | ~180 | 15-30 min |
+| Example config as shipped (40/market) | ~720 | 1-2 hours |
+
+Start small. The cache means a bigger second pass only pays for what's new,
+and an interrupted run keeps everything it had already fetched.
 
 ## Being a good citizen
 
 - `robots.txt` is respected by default; `--ignore-robots` exists but leave it
   alone.
-- Requests to any single site are delayed (1.5s default) and capped at the
+- Requests are rate-limited **per domain** (1.5s default) and capped at the
   homepage plus 2 contact/about pages.
 - Only publicly published pages are read — nothing behind a login, no captcha
   evasion, no social-platform scraping.
@@ -197,6 +216,33 @@ scoring signal and why phone and WhatsApp columns exist.
 `areas` to the market to break past it.
 
 The tool exits non-zero on setup errors, so it's safe to chain in a script.
+
+## What's verified, and what isn't
+
+Worth knowing before you trust the first run.
+
+**Verified** — every code path is covered by tests running against a mocked
+Places API and real local HTTP servers: pagination, per-market localization,
+scoring and tiering, chain and closed-business exclusion, multilingual email
+selection, WhatsApp/social/booking-platform extraction, `robots.txt`
+handling, caching, CSV/JSON output, and every error path (bad key, no key,
+bad config, network failure, unreachable and timing-out sites). The tool
+exits non-zero on setup errors and has no known crash.
+
+**Not verified** — two things need your API key and a real network:
+
+1. **Live Places responses.** Only the authentication path has been exercised
+   against Google (a deliberate bad key returns a genuine `REQUEST_DENIED`).
+   Real result payloads have not been. Missing fields are all handled
+   defensively, but the first live run is the real test.
+2. **Real-world websites.** Crawling was validated against local servers
+   serving realistic HTML, not the open web. Expect surprises from Cloudflare
+   challenges, cookie walls, JS-only contact pages, and redirect chains.
+   These degrade to a blank email rather than an error, so they cost signal,
+   not stability.
+
+Do a `scan` of one city you know well first and eyeball the CSV — you'll
+immediately see whether the category query and ICP weights match reality.
 
 ## Limitations
 

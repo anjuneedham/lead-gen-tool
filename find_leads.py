@@ -111,6 +111,7 @@ def build_clients(args, api_key):
     enricher = SiteEnricher(
         delay=args.site_delay,
         respect_robots=not args.ignore_robots,
+        cache=cache,
     )
     return client, enricher, cache
 

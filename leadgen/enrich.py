@@ -8,7 +8,7 @@ booking platform already, can a human even reach them. That's what this reads.
 
 import re
 import urllib.robotparser
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from html import unescape
 from urllib.parse import urljoin, urlparse
 
@@ -224,17 +224,38 @@ def extract_signals(html, soup, into):
 
 
 class SiteEnricher:
-    def __init__(self, session=None, sleep=None, delay=1.5, respect_robots=True):
+    def __init__(self, session=None, sleep=None, delay=1.5, respect_robots=True, cache=None):
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
         self.delay = delay
         self.respect_robots = respect_robots
+        self.cache = cache
         self._robots = {}
+        self._last_hit = {}
         if sleep is None:
             import time as _time
 
             sleep = _time.sleep
         self.sleep = sleep
+        self._now = __import__("time").monotonic
+
+    def _throttle(self, url):
+        """Rate-limit per domain, not globally.
+
+        Politeness is owed to each host separately — sleeping between requests
+        to two unrelated businesses just makes a long run longer without making
+        it any kinder.
+        """
+        if self.delay <= 0:
+            return
+        domain = urlparse(url).netloc.lower()
+        last = self._last_hit.get(domain)
+        now = self._now()
+        if last is not None:
+            wait = self.delay - (now - last)
+            if wait > 0:
+                self.sleep(wait)
+        self._last_hit[domain] = self._now()
 
     def _allowed(self, url):
         if not self.respect_robots:
@@ -272,7 +293,12 @@ class SiteEnricher:
             return None
 
     def enrich(self, website):
-        """Crawl a business site for contact and operating signals."""
+        """Crawl a business site for contact and operating signals.
+
+        Results are cached alongside the API responses, so retuning ICP
+        weights and re-scoring doesn't re-crawl — which keeps the tighten-the-
+        model loop fast, and spares the businesses a pointless second visit.
+        """
         result = Enrichment()
         if not website:
             return result
@@ -280,15 +306,24 @@ class SiteEnricher:
         url = website if website.startswith(("http://", "https://")) else f"https://{website}"
         site_domain = urlparse(url).netloc.lower().removeprefix("www.")
 
+        cache_key = f"site:{url}"
+        if self.cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                return Enrichment(**cached)
+
         if not self._allowed(url):
             result.blocked_by_robots = True
             result.error = "disallowed by robots.txt"
+            self._remember(cache_key, result)
             return result
 
-        self.sleep(self.delay)
+        self._throttle(url)
         html = self._fetch(url)
         if not html:
             result.error = "homepage unreachable"
+            # Deliberately not cached: an unreachable site is often a transient
+            # outage, and caching it would bake the failure in for 30 days.
             return result
 
         result.site_reachable = True
@@ -303,7 +338,7 @@ class SiteEnricher:
             for link in self._contact_links(soup, url):
                 if not self._allowed(link):
                     continue
-                self.sleep(self.delay)
+                self._throttle(link)
                 sub_html = self._fetch(link)
                 if not sub_html:
                     continue
@@ -317,7 +352,12 @@ class SiteEnricher:
 
         result.email = best
         result.all_emails = sorted(emails)
+        self._remember(cache_key, result)
         return result
+
+    def _remember(self, key, result):
+        if self.cache:
+            self.cache.set(key, asdict(result))
 
     def _contact_links(self, soup, base_url):
         base_domain = urlparse(base_url).netloc
